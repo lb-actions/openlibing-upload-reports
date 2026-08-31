@@ -1,0 +1,32 @@
+name: 'Upload Metadata to OpenLibing'
+description: 'Upload test metadata and results to OpenLibing OBS bucket'
+author: 'openlibing'
+
+inputs:
+  files:
+    description: 'File paths to upload (space-separated). Example: "metadata.xml results.xml"'
+    required: true
+  openlibing-secret:
+    description: 'JSON string containing apig_code. Supports both {"key":"value"} and {key:value} formats.'
+    required: true
+  github-token:
+    description: 'GitHub token for API authentication. Required if not using label.'
+    required: false
+  label:
+    description: 'Label for archive path (e.g., "performance", "precision", "simulation"). Required if not using pipeline params.'
+    required: false
+  archive-path:
+    description: 'Custom archive path. Must be used with label. Archive path becomes /{label}/{archive_path}/{filename}.'
+    required: false
+
+outputs:
+  success:
+    description: 'Upload success status (true/false)'
+  status-code:
+    description: 'HTTP response status code'
+  response-text:
+    description: 'HTTP response text'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
