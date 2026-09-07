@@ -1,12 +1,27 @@
 import * as core from "@actions/core";
 import axios from "axios";
-import FormData from "form-data";
 import * as fs from "fs";
 import * as path from "path";
 import * as mime from "mime-types";
 
-interface OpenlibingSecret {
-  apig_code?: string;
+const { callApig, configure } = require("@openlibing/huaweicloud-oidc-client") as {
+  callApig: (
+    method: string,
+    url: string,
+    headers?: Record<string, string>,
+    body?: Buffer | string,
+    opts?: { force?: boolean; region?: string }
+  ) => Promise<{ status: number; headers: Record<string, string>; data: any }>;
+  configure: (overrides?: Record<string, unknown>) => Record<string, unknown>;
+};
+
+// 本插件运行在 GitHub Actions，覆盖 SDK 默认的 GitCodeActions 提供商
+configure({ oidcProviderName: "GitHubActions", agencyName: "github-actions" });
+
+interface MultipartFile {
+  filename: string;
+  contentType: string;
+  buffer: Buffer;
 }
 
 interface UploadConfig {
@@ -64,58 +79,43 @@ function validateFilePath(filePath: string): string {
 }
 
 /**
- * Process JSON parameter with security validation.
- * Supports both standard JSON and simplified format (without quotes).
- * Validates that only allowed fields are present.
+ * Build a multipart/form-data body as a single Buffer with a fixed boundary.
+ * V11 signing requires the complete body upfront (cannot sign streaming bodies),
+ * so files are read into memory and concatenated with a boundary shared between
+ * the body and the Content-Type header.
  */
-function processJsonParam(param: string): OpenlibingSecret {
-  if (!param || param.trim() === "") {
-    throw new Error("JSON parameter cannot be empty");
-  }
+function buildMultipartBody(
+  fields: Record<string, string>,
+  files: MultipartFile[],
+  boundary: string
+): Buffer {
+  const eol = "\r\n";
+  const parts: Buffer[] = [];
 
-  // Allowed fields whitelist for openlibing-secret
-  const ALLOWED_FIELDS = ["apig_code"];
-
-  let parsed: Record<string, string>;
-  try {
-    // Try standard JSON first
-    if (param.includes('"')) {
-      parsed = JSON.parse(param);
-    } else {
-      // Handle simplified format: {key:value,key:value}
-      const inner = param.trim().replace(/^{|}$/g, "");
-      const result: Record<string, string> = {};
-      const pairs = inner.split(",");
-      for (const pair of pairs) {
-        const trimmedPair = pair.trim();
-        if (!trimmedPair) continue;
-        const colonIndex = trimmedPair.indexOf(":");
-        if (colonIndex > 0) {
-          const k = trimmedPair.substring(0, colonIndex).trim();
-          const v = trimmedPair.substring(colonIndex + 1).trim();
-          if (k) {
-            result[k] = v;
-          }
-        }
-      }
-      parsed = result;
-    }
-  } catch (e: any) {
-    throw new Error(`Failed to parse JSON parameter: ${e.message}`);
-  }
-
-  // Validate that only allowed fields are present
-  const unknownFields = Object.keys(parsed).filter(
-    (k) => !ALLOWED_FIELDS.includes(k)
-  );
-  if (unknownFields.length > 0) {
-    throw new Error(
-      `Unknown fields in openlibing-secret: ${unknownFields.join(", ")}. ` +
-        `Allowed fields: ${ALLOWED_FIELDS.join(", ")}`
+  for (const [name, value] of Object.entries(fields)) {
+    parts.push(
+      Buffer.from(
+        `--${boundary}${eol}` +
+          `Content-Disposition: form-data; name="${name}"${eol}${eol}` +
+          `${value}${eol}`
+      )
     );
   }
 
-  return parsed as OpenlibingSecret;
+  for (const file of files) {
+    parts.push(
+      Buffer.from(
+        `--${boundary}${eol}` +
+          `Content-Disposition: form-data; name="files"; filename="${file.filename}"${eol}` +
+          `Content-Type: ${file.contentType}${eol}${eol}`
+      )
+    );
+    parts.push(file.buffer);
+    parts.push(Buffer.from(eol));
+  }
+
+  parts.push(Buffer.from(`--${boundary}--${eol}`));
+  return Buffer.concat(parts);
 }
 
 /**
@@ -237,14 +237,16 @@ async function fetchWorkflowIdFromGitHub(githubToken: string): Promise<string> {
 
 /**
  * Upload files to OpenLibing OBS bucket.
+ * Uses OIDC-federated credentials via the SDK's callApig (auto V11-HMAC-SHA256
+ * signing + X-Security-Token); the multipart body is built as a single Buffer
+ * so V11 payload hashing can run over the complete body.
  */
 async function uploadFiles(
   files: string[],
-  openlibingSecret: OpenlibingSecret,
   uploadConfig: UploadConfig
 ): Promise<UploadResult> {
   const url =
-    "https://apig.openlibing.com/openlibing-sync/sync/testcase/metadata/upload";
+    "https://apig.openlibing.com/openlibing-sync/sync/testcase/metadata/upload-iam";
   const workflowId = uploadConfig.workflowId || "";
   const pipelineRunId = uploadConfig.pipelineRunId || "";
   const jobId = uploadConfig.jobId || "";
@@ -254,24 +256,16 @@ async function uploadFiles(
   console.log(`Uploading ${files.length} files to OpenLibing...`);
   console.log(`URL: ${url}`);
 
-  // Build headers
-  const headers = {
-    "X-Apig-Appcode": openlibingSecret.apig_code || "",
-    "AppKey": "",
-    "AppSecret": "",
-    "User-Agent": "Node.js-axios/1.6.0",
-  };
-
-  // Build form data
-  const formData = new FormData();
+  const boundary = "----OpenLibingUpload" + Math.random().toString(16).slice(2);
+  const fields: Record<string, string> = {};
   if (workflowId) {
-    formData.append("pipelineId", workflowId);
+    fields.pipelineId = workflowId;
   }
   if (pipelineRunId) {
-    formData.append("pipelineRunId", pipelineRunId);
+    fields.pipelineRunId = pipelineRunId;
   }
   if (jobId) {
-    formData.append("jobId", jobId);
+    fields.jobId = jobId;
   }
 
   const archiveConfig: Record<string, string> = {};
@@ -282,67 +276,47 @@ async function uploadFiles(
     archiveConfig.archivePath = archivePath;
   }
   if (Object.keys(archiveConfig).length > 0) {
-    formData.append("archiveConfig", JSON.stringify(archiveConfig));
+    fields.archiveConfig = JSON.stringify(archiveConfig);
   }
 
-  // Add files and track streams for proper resource management
+  const fileParts: MultipartFile[] = [];
   const validFiles: string[] = [];
-  const streams: fs.ReadStream[] = [];
-
-  try {
-    for (const filePath of files) {
-      // Security: Validate file path to prevent arbitrary file read
-      const validatedPath = validateFilePath(filePath);
-      if (!fs.existsSync(validatedPath)) {
-        console.log(`Warning: File not found, skipping: ${filePath}`);
-        continue;
-      }
-      const fileName = path.basename(validatedPath);
-      const mimeType =
-        mime.lookup(validatedPath) || "application/octet-stream";
-
-      const stream = fs.createReadStream(validatedPath);
-      streams.push(stream);
-      formData.append("files", stream, {
-        filename: fileName,
-        contentType: mimeType,
-      });
-      validFiles.push(fileName);
+  for (const filePath of files) {
+    // Security: Validate file path to prevent arbitrary file read
+    const validatedPath = validateFilePath(filePath);
+    if (!fs.existsSync(validatedPath)) {
+      console.log(`Warning: File not found, skipping: ${filePath}`);
+      continue;
     }
-
-    if (validFiles.length === 0) {
-      throw new Error("No valid files to upload");
-    }
-    console.log(`Uploading ${validFiles.length} files: ${validFiles.join(", ")}`);
-
-    const mergedHeaders = {
-      ...headers,
-      ...formData.getHeaders(),
-    };
-
-    // Send request
-    const response = await axios.post(url, formData, {
-      headers: mergedHeaders,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      validateStatus: (status) => status < 500,
+    const fileName = path.basename(validatedPath);
+    const mimeType = mime.lookup(validatedPath) || "application/octet-stream";
+    fileParts.push({
+      filename: fileName,
+      contentType: mimeType,
+      buffer: fs.readFileSync(validatedPath),
     });
-
-    console.log(`Upload response status: ${response.status}`);
-    console.log(`Upload response text: ${JSON.stringify(response.data)}`);
-
-    return {
-      status: response.status,
-      data: response.data,
-    };
-  } finally {
-    // Clean up: close all streams to prevent resource leaks
-    for (const stream of streams) {
-      if (!stream.destroyed) {
-        stream.destroy();
-      }
-    }
+    validFiles.push(fileName);
   }
+
+  if (validFiles.length === 0) {
+    throw new Error("No valid files to upload");
+  }
+  console.log(`Uploading ${validFiles.length} files: ${validFiles.join(", ")}`);
+
+  const body = buildMultipartBody(fields, fileParts, boundary);
+  const headers = {
+    "Content-Type": `multipart/form-data; boundary=${boundary}`,
+  };
+
+  const response = await callApig("POST", url, headers, body);
+
+  console.log(`Upload response status: ${response.status}`);
+  console.log(`Upload response text: ${JSON.stringify(response.data)}`);
+
+  return {
+    status: response.status,
+    data: response.data,
+  };
 }
 
 async function run(): Promise<void> {
@@ -354,7 +328,6 @@ async function run(): Promise<void> {
     // Step 1: Get input parameters
     core.startGroup("Step 1: Get input parameters");
     const filesInput = core.getInput("files", { required: true });
-    const secretRaw = core.getInput("openlibing-secret", { required: true });
     const labelRaw = core.getInput("label", { required: false });
     const archivePathRaw = core.getInput("archive-path", { required: false });
 
@@ -385,7 +358,6 @@ async function run(): Promise<void> {
     }
 
     const files = filesInput.split(/\s+/).filter((f) => f.length > 0);
-    const openlibingSecret = processJsonParam(secretRaw);
 
     console.log("Input parameters loaded:");
     console.log(`  - files: ${files.join(", ")}`);
@@ -417,11 +389,6 @@ async function run(): Promise<void> {
           );
         }
       }
-
-      if (Object.keys(openlibingSecret).length === 0) {
-        core.error("Failed to parse openlibing-secret");
-        throw new Error("Failed to parse openlibing-secret");
-      }
     } finally {
       core.endGroup();
     }
@@ -430,7 +397,7 @@ async function run(): Promise<void> {
     core.startGroup("Step 3: Upload files");
     let uploadResult: UploadResult;
     try {
-      uploadResult = await uploadFiles(files, openlibingSecret, {
+      uploadResult = await uploadFiles(files, {
         workflowId,
         pipelineRunId,
         jobId,

@@ -6,9 +6,6 @@ inputs:
   files:
     description: 'File paths to upload (space-separated). Example: "metadata.xml results.xml"'
     required: true
-  openlibing-secret:
-    description: 'JSON string containing apig_code. Supports both {"key":"value"} and {key:value} formats.'
-    required: true
   github-token:
     description: 'GitHub token for API authentication. Required if not using label.'
     required: false
