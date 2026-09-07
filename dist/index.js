@@ -45,10 +45,12 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __importStar(__nccwpck_require__(7484));
 const axios_1 = __importDefault(__nccwpck_require__(7269));
-const form_data_1 = __importDefault(__nccwpck_require__(6454));
 const fs = __importStar(__nccwpck_require__(9896));
 const path = __importStar(__nccwpck_require__(6928));
 const mime = __importStar(__nccwpck_require__(4096));
+const { callApig, configure } = __nccwpck_require__(6239);
+// 本插件运行在 GitHub Actions，覆盖 SDK 默认的 GitCodeActions 提供商
+configure({ oidcProviderName: "GitHubActions", agencyName: "github-actions" });
 /**
  * Validate file path for security.
  * Prevents path traversal attacks and restricts absolute paths to allowed directories.
@@ -81,53 +83,28 @@ function validateFilePath(filePath) {
     return resolvedPath;
 }
 /**
- * Process JSON parameter with security validation.
- * Supports both standard JSON and simplified format (without quotes).
- * Validates that only allowed fields are present.
+ * Build a multipart/form-data body as a single Buffer with a fixed boundary.
+ * V11 signing requires the complete body upfront (cannot sign streaming bodies),
+ * so files are read into memory and concatenated with a boundary shared between
+ * the body and the Content-Type header.
  */
-function processJsonParam(param) {
-    if (!param || param.trim() === "") {
-        throw new Error("JSON parameter cannot be empty");
+function buildMultipartBody(fields, files, boundary) {
+    const eol = "\r\n";
+    const parts = [];
+    for (const [name, value] of Object.entries(fields)) {
+        parts.push(Buffer.from(`--${boundary}${eol}` +
+            `Content-Disposition: form-data; name="${name}"${eol}${eol}` +
+            `${value}${eol}`));
     }
-    // Allowed fields whitelist for openlibing-secret
-    const ALLOWED_FIELDS = ["apig_code"];
-    let parsed;
-    try {
-        // Try standard JSON first
-        if (param.includes('"')) {
-            parsed = JSON.parse(param);
-        }
-        else {
-            // Handle simplified format: {key:value,key:value}
-            const inner = param.trim().replace(/^{|}$/g, "");
-            const result = {};
-            const pairs = inner.split(",");
-            for (const pair of pairs) {
-                const trimmedPair = pair.trim();
-                if (!trimmedPair)
-                    continue;
-                const colonIndex = trimmedPair.indexOf(":");
-                if (colonIndex > 0) {
-                    const k = trimmedPair.substring(0, colonIndex).trim();
-                    const v = trimmedPair.substring(colonIndex + 1).trim();
-                    if (k) {
-                        result[k] = v;
-                    }
-                }
-            }
-            parsed = result;
-        }
+    for (const file of files) {
+        parts.push(Buffer.from(`--${boundary}${eol}` +
+            `Content-Disposition: form-data; name="files"; filename="${file.filename}"${eol}` +
+            `Content-Type: ${file.contentType}${eol}${eol}`));
+        parts.push(file.buffer);
+        parts.push(Buffer.from(eol));
     }
-    catch (e) {
-        throw new Error(`Failed to parse JSON parameter: ${e.message}`);
-    }
-    // Validate that only allowed fields are present
-    const unknownFields = Object.keys(parsed).filter((k) => !ALLOWED_FIELDS.includes(k));
-    if (unknownFields.length > 0) {
-        throw new Error(`Unknown fields in openlibing-secret: ${unknownFields.join(", ")}. ` +
-            `Allowed fields: ${ALLOWED_FIELDS.join(", ")}`);
-    }
-    return parsed;
+    parts.push(Buffer.from(`--${boundary}--${eol}`));
+    return Buffer.concat(parts);
 }
 /**
  * Validate label parameter for security.
@@ -228,9 +205,12 @@ async function fetchWorkflowIdFromGitHub(githubToken) {
 }
 /**
  * Upload files to OpenLibing OBS bucket.
+ * Uses OIDC-federated credentials via the SDK's callApig (auto V11-HMAC-SHA256
+ * signing + X-Security-Token); the multipart body is built as a single Buffer
+ * so V11 payload hashing can run over the complete body.
  */
-async function uploadFiles(files, openlibingSecret, uploadConfig) {
-    const url = "https://apig.openlibing.com/openlibing-sync/sync/testcase/metadata/upload";
+async function uploadFiles(files, uploadConfig) {
+    const url = "https://apig.openlibing.com/openlibing-sync/sync/testcase/metadata/upload-iam";
     const workflowId = uploadConfig.workflowId || "";
     const pipelineRunId = uploadConfig.pipelineRunId || "";
     const jobId = uploadConfig.jobId || "";
@@ -238,23 +218,16 @@ async function uploadFiles(files, openlibingSecret, uploadConfig) {
     const archivePath = uploadConfig.archivePath || "";
     console.log(`Uploading ${files.length} files to OpenLibing...`);
     console.log(`URL: ${url}`);
-    // Build headers
-    const headers = {
-        "X-Apig-Appcode": openlibingSecret.apig_code || "",
-        "AppKey": "",
-        "AppSecret": "",
-        "User-Agent": "Node.js-axios/1.6.0",
-    };
-    // Build form data
-    const formData = new form_data_1.default();
+    const boundary = "----OpenLibingUpload" + Math.random().toString(16).slice(2);
+    const fields = {};
     if (workflowId) {
-        formData.append("pipelineId", workflowId);
+        fields.pipelineId = workflowId;
     }
     if (pipelineRunId) {
-        formData.append("pipelineRunId", pipelineRunId);
+        fields.pipelineRunId = pipelineRunId;
     }
     if (jobId) {
-        formData.append("jobId", jobId);
+        fields.jobId = jobId;
     }
     const archiveConfig = {};
     if (label) {
@@ -264,59 +237,41 @@ async function uploadFiles(files, openlibingSecret, uploadConfig) {
         archiveConfig.archivePath = archivePath;
     }
     if (Object.keys(archiveConfig).length > 0) {
-        formData.append("archiveConfig", JSON.stringify(archiveConfig));
+        fields.archiveConfig = JSON.stringify(archiveConfig);
     }
-    // Add files and track streams for proper resource management
+    const fileParts = [];
     const validFiles = [];
-    const streams = [];
-    try {
-        for (const filePath of files) {
-            // Security: Validate file path to prevent arbitrary file read
-            const validatedPath = validateFilePath(filePath);
-            if (!fs.existsSync(validatedPath)) {
-                console.log(`Warning: File not found, skipping: ${filePath}`);
-                continue;
-            }
-            const fileName = path.basename(validatedPath);
-            const mimeType = mime.lookup(validatedPath) || "application/octet-stream";
-            const stream = fs.createReadStream(validatedPath);
-            streams.push(stream);
-            formData.append("files", stream, {
-                filename: fileName,
-                contentType: mimeType,
-            });
-            validFiles.push(fileName);
+    for (const filePath of files) {
+        // Security: Validate file path to prevent arbitrary file read
+        const validatedPath = validateFilePath(filePath);
+        if (!fs.existsSync(validatedPath)) {
+            console.log(`Warning: File not found, skipping: ${filePath}`);
+            continue;
         }
-        if (validFiles.length === 0) {
-            throw new Error("No valid files to upload");
-        }
-        console.log(`Uploading ${validFiles.length} files: ${validFiles.join(", ")}`);
-        const mergedHeaders = {
-            ...headers,
-            ...formData.getHeaders(),
-        };
-        // Send request
-        const response = await axios_1.default.post(url, formData, {
-            headers: mergedHeaders,
-            maxContentLength: Infinity,
-            maxBodyLength: Infinity,
-            validateStatus: (status) => status < 500,
+        const fileName = path.basename(validatedPath);
+        const mimeType = mime.lookup(validatedPath) || "application/octet-stream";
+        fileParts.push({
+            filename: fileName,
+            contentType: mimeType,
+            buffer: fs.readFileSync(validatedPath),
         });
-        console.log(`Upload response status: ${response.status}`);
-        console.log(`Upload response text: ${JSON.stringify(response.data)}`);
-        return {
-            status: response.status,
-            data: response.data,
-        };
+        validFiles.push(fileName);
     }
-    finally {
-        // Clean up: close all streams to prevent resource leaks
-        for (const stream of streams) {
-            if (!stream.destroyed) {
-                stream.destroy();
-            }
-        }
+    if (validFiles.length === 0) {
+        throw new Error("No valid files to upload");
     }
+    console.log(`Uploading ${validFiles.length} files: ${validFiles.join(", ")}`);
+    const body = buildMultipartBody(fields, fileParts, boundary);
+    const headers = {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+    };
+    const response = await callApig("POST", url, headers, body);
+    console.log(`Upload response status: ${response.status}`);
+    console.log(`Upload response text: ${JSON.stringify(response.data)}`);
+    return {
+        status: response.status,
+        data: response.data,
+    };
 }
 async function run() {
     try {
@@ -326,7 +281,6 @@ async function run() {
         // Step 1: Get input parameters
         core.startGroup("Step 1: Get input parameters");
         const filesInput = core.getInput("files", { required: true });
-        const secretRaw = core.getInput("openlibing-secret", { required: true });
         const labelRaw = core.getInput("label", { required: false });
         const archivePathRaw = core.getInput("archive-path", { required: false });
         // Security: Validate label and archive-path parameters
@@ -354,7 +308,6 @@ async function run() {
             jobId = await fetchJobIdFromGitHub(githubToken);
         }
         const files = filesInput.split(/\s+/).filter((f) => f.length > 0);
-        const openlibingSecret = processJsonParam(secretRaw);
         console.log("Input parameters loaded:");
         console.log(`  - files: ${files.join(", ")}`);
         console.log(`  - workflow-id: ${workflowId || "(not set)"}`);
@@ -378,10 +331,6 @@ async function run() {
                     throw new Error("Pipeline mode requires workflow-id, pipeline-run-id and job-id");
                 }
             }
-            if (Object.keys(openlibingSecret).length === 0) {
-                core.error("Failed to parse openlibing-secret");
-                throw new Error("Failed to parse openlibing-secret");
-            }
         }
         finally {
             core.endGroup();
@@ -390,7 +339,7 @@ async function run() {
         core.startGroup("Step 3: Upload files");
         let uploadResult;
         try {
-            uploadResult = await uploadFiles(files, openlibingSecret, {
+            uploadResult = await uploadFiles(files, {
                 workflowId,
                 pipelineRunId,
                 jobId,
@@ -3635,6 +3584,896 @@ function copyFile(srcFile, destFile, force) {
     });
 }
 //# sourceMappingURL=io.js.map
+
+/***/ }),
+
+/***/ 578:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+/**
+ * APIG 调用封装模块：callApig 一行调用 APIG 接口。
+ * 自动完成：临时凭证获取（带缓存 / force 强制刷新）-> V11-HMAC-SHA256 签名 ->
+ * X-Security-Token 注入 -> 发送请求。需精细控制时可自行组合 V11Signer + sendRequest。
+ */
+
+const { cfg } = __nccwpck_require__(3298);
+const { getCredentials } = __nccwpck_require__(6477);
+const { V11Signer } = __nccwpck_require__(9692);
+const { sendRequest } = __nccwpck_require__(5531);
+
+/**
+ * 调用 APIG 接口：自动换证（带缓存）、V11 签名（自动携带 X-Security-Token）并发送请求。
+ * 需精细控制时可自行组合 V11Signer + sendRequest。
+ *
+ * headers / body / opts 均为可选参数，可同时设置，也可只设置其中几个；
+ * 跳过中间参数时传 null（如仅设置 opts：callApig('GET', url, null, null, { force: true })）。
+ * @param {string} method HTTP 方法（GET/POST 等）
+ * @param {string} url    完整 APIG URL（https://{host}{path}[?query]）
+ * @param {Object} [headers] 附加请求头（与默认 Content-Type 头合并）
+ * @param {string} [body]    请求体（字符串）
+ * @param {Object} [opts]    额外选项：{ force } 强制刷新临时凭证、{ region } 覆盖签名区域
+ * @returns {Promise<{status: number, headers: Object, data: Object|string|null}>} 同 sendRequest 返回
+ */
+async function callApig(method, url, headers, body, opts = {}) {
+  const cred = await getCredentials({ force: !!opts.force });
+  const signer = new V11Signer({ region: opts.region || cfg.region });
+  signer.Key = cred.accessKeyId;
+  signer.Secret = cred.secretAccessKey;
+  const mergedHeaders = { 'Content-Type': 'application/json', ...(headers || {}) };
+  if (cred.securityToken) {
+    mergedHeaders['X-Security-Token'] = cred.securityToken;
+  }
+  const reqBody = body || '';
+  const signedHeaders = signer.sign(method, url, mergedHeaders, reqBody);
+  return sendRequest(method, url, signedHeaders, reqBody);
+}
+
+module.exports = { callApig };
+
+
+/***/ }),
+
+/***/ 3298:
+/***/ ((module) => {
+
+"use strict";
+
+
+/**
+ * 配置模块：内置 openlibing 默认配置 + configure() 覆盖。
+ * 模块级单例 cfg 供 logger / http / oidc / credentials 共享。
+ */
+
+// 内置固定配置（openlibing 账号）
+const CONFIG = {
+  // openlibing 华为云账号 ID
+  accountId: '4d29a984c4fe4e6eb5d404a853d0084e',
+  // OIDC 受众（申请 OIDC ID Token 的 audience，需与身份提供商注册的客户端 ID 一致）
+  audience: 'huawei-cloud-service',
+  // IAM 信任委托名称
+  agencyName: 'gitcode-actions',
+  // OIDC 身份提供商名称（华为云侧按令牌签发平台分别注册：GitHub 平台为 GitHubActions，
+  // GitCode Actions 平台为 GitCodeActions）。取 configure() 配置值，
+  // 可通过显式 configure({ oidcProviderName }) 覆盖
+  oidcProviderName: 'GitCodeActions',
+  // 区域（openlibing 账号固定区域，可显式覆盖）
+  region: 'cn-southwest-2',
+  // STS 换证路径
+  stsAssumePath: '/v5/agencies/assume-with-oidc',
+  // 临时凭证默认有效期（秒）
+  durationSeconds: 3600,
+  // 提前刷新缓冲（秒），避免凭证在边界过期
+  refreshBufferSeconds: 300,
+  // 调试模式：开启后打印关键步骤日志（含每次 HTTP 请求/响应详情，敏感字段自动脱敏）
+  debug: false
+};
+
+// 当前生效配置（可用 configure() 覆盖）
+const cfg = { ...CONFIG };
+
+/**
+ * 覆盖内置配置（如更换账号 / 区域 / 受众 / 委托等）。
+ * @param {Object} overrides 可覆盖字段：accountId/audience/agencyName/oidcProviderName/
+ *                           region/stsAssumePath/durationSeconds/refreshBufferSeconds/debug
+ * @returns {Object} 覆盖后的完整配置（含全部内置默认值）
+ */
+function configure(overrides = {}) {
+  const allowed = [
+    'accountId', 'audience', 'agencyName', 'oidcProviderName',
+    'region', 'stsAssumePath', 'durationSeconds', 'refreshBufferSeconds', 'debug'
+  ];
+  for (const k of allowed) {
+    if (overrides[k] !== undefined) {
+      cfg[k] = overrides[k];
+    }
+  }
+  return { ...cfg };
+}
+
+module.exports = { CONFIG, cfg, configure };
+
+
+/***/ }),
+
+/***/ 6477:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+/**
+ * 临时凭证模块：getCredentials() 获取华为云临时凭证。
+ * 调用链 CI 流水线（GitHub Actions / GitCode Actions 等 Actions 兼容平台）OIDC ID Token
+ * -> 华为云 STS AssumeAgencyWithOIDC，带缓存自动刷新、force 强制刷新、并发去重。
+ */
+
+const { cfg } = __nccwpck_require__(3298);
+const { info, debug, error, mask, maskBody } = __nccwpck_require__(9463);
+const { sendRequest } = __nccwpck_require__(5531);
+const { getOidcToken } = __nccwpck_require__(8790);
+
+let _credentials = null; // { accessKeyId, secretAccessKey, securityToken, expiresAt, expiresAtISO }
+let _credentialPromise = null; // 进行中的换证 Promise（并发去重）
+
+/** 判断缓存凭证是否仍有效（未过期且留有缓冲时间）。 */
+function _isValid(cred) {
+  if (!cred || !cred.expiresAt) {
+    return false;
+  }
+  return Date.now() < cred.expiresAt - cfg.refreshBufferSeconds * 1000;
+}
+
+/**
+ * 获取 openlibing 账号下的华为云临时凭证。
+ * 优先级：有效缓存 > OIDC+STS 换证。
+ * @param {Object} [opts]
+ * @param {boolean} [opts.force] 为 true 时强制重新换证（忽略缓存）
+ * @returns {Promise<{accessKeyId: string, secretAccessKey: string,
+ *                     securityToken: string|null, expiresAt: string|null, expiresIn: number|null}>}
+ */
+async function getCredentials(opts = {}) {
+  if (!opts.force && _isValid(_credentials)) {
+    const expiresIn = Math.max(0, Math.round((_credentials.expiresAt - Date.now()) / 1000));
+    debug(`-- 临时凭证缓存有效，直接复用（剩余约 ${expiresIn} 秒）--`);
+    return {
+      accessKeyId: _credentials.accessKeyId,
+      secretAccessKey: _credentials.secretAccessKey,
+      securityToken: _credentials.securityToken,
+      expiresAt: _credentials.expiresAtISO,
+      expiresIn
+    };
+  }
+  if (_credentials) {
+    debug('-- 临时凭证缓存缺失或已过期，重新换取 --');
+  }
+  const cred = await _exchangeCredentials();
+  return {
+    accessKeyId: cred.accessKeyId,
+    secretAccessKey: cred.secretAccessKey,
+    securityToken: cred.securityToken,
+    expiresAt: cred.expiresAtISO,
+    expiresIn: Math.max(0, Math.round((cred.expiresAt - Date.now()) / 1000))
+  };
+}
+
+/** 解析 OIDC Token payload 中的关键声明（失败返回 null）。 */
+function _parseTokenClaims(idToken) {
+  try {
+    const payload = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64url').toString());
+    return { iss: payload.iss, aud: payload.aud, azp: payload.azp, sub: payload.sub };
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 打印 OIDC Token 声明（logFn 传 debug 为调试定位，传 error 为失败定位）。 */
+function _printTokenClaims(claims, logFn) {
+  if (!claims) {
+    logFn('（无法解析 OIDC Token payload）');
+    return;
+  }
+  logFn('-- OIDC Token 声明（用于与华为云信任策略比对）--');
+  logFn(`iss : ${JSON.stringify(claims.iss)}`);
+  logFn(`aud : ${JSON.stringify(claims.aud)}`);
+  logFn(`azp : ${JSON.stringify(claims.azp)}`);
+  logFn(`sub : ${JSON.stringify(claims.sub)}`);
+}
+
+/**
+ * 通过流水线签发的 OIDC JWT 调用 STS AssumeAgencyWithOIDC 换取临时 AK/SK/SecurityToken。
+ * OIDC 提供商取 configure() 配置值（需与华为云 IAM 侧注册名一致）；
+ * iss/aud/azp/sub 声明调试模式下打印、STS 失败时以 error 级补打，用于与信任策略比对排查。
+ * @returns {Promise<{accessKeyId: string, secretAccessKey: string,
+ *                     securityToken: string, expiresAt: number, expiresAtISO: string}>}
+ */
+async function _assumeAgencyWithOIDC() {
+  const agencyUrn = `iam::${cfg.accountId}:agency:${cfg.agencyName}`;
+  const stsEndpoint = `https://sts.${cfg.region}.myhuaweicloud.com${cfg.stsAssumePath}`;
+
+  debug('=== 步骤1：申请 OIDC ID Token ===');
+  debug(`audience=${cfg.audience}`);
+  const idToken = await getOidcToken();
+  if (!idToken) {
+    throw new Error('获取 OIDC ID Token 为空（请确认流水线已声明 permissions: id-token: write）');
+  }
+  debug(`OIDC Token 获取成功，长度 ${idToken.length}`);
+
+  const claims = _parseTokenClaims(idToken);
+  _printTokenClaims(claims, debug);
+
+  const providerName = cfg.oidcProviderName;
+  const providerUrn = `iam::${cfg.accountId}:oidcProvider:${providerName}`;
+
+  const body = {
+    provider_urn: providerUrn,
+    agency_urn: agencyUrn,
+    agency_session_name: cfg.agencyName,
+    id_token: idToken,
+    duration_seconds: cfg.durationSeconds
+  };
+
+  info(`-- OIDC 免密换证开始：区域 ${cfg.region}，提供商 ${providerName}，委托 ${cfg.agencyName} --`);
+  debug('=== 步骤2：调用 STS AssumeAgencyWithOIDC ===');
+  debug(`provider_urn        : ${body.provider_urn}`);
+  debug(`agency_urn          : ${body.agency_urn}`);
+  debug(`agency_session_name : ${body.agency_session_name}`);
+  debug(`duration_seconds    : ${body.duration_seconds}`);
+
+  const res = await sendRequest('POST', stsEndpoint, { 'Content-Type': 'application/json' }, JSON.stringify(body));
+
+  if (res.status !== 200) {
+    const code = res.data && (res.data.error_code || res.data.code);
+    const msg = res.data && (res.data.error_msg || res.data.message);
+    error(`STS 失败详情 : ${maskBody(res.data)}`);
+    // 失败定位：非调试模式下也补打 Token 声明与换证配置，供与信任策略逐项比对
+    _printTokenClaims(claims, error);
+    error(`provider_urn : ${providerUrn}`);
+    error('=== 排查提示 ===');
+    error('STS5.1001/403：多为信任策略条件不匹配，请将上方 OIDC Token 的 iss/aud/azp/sub 与华为云信任策略逐项比对。');
+    error('  - iss 必须与所选 OIDC 提供商注册的颁发者 URL 严格一致（GitHub 平台为 https://token.actions.githubusercontent.com，GitCode Actions 平台以其流水线签发地址为准）');
+    error('  - aud/azp 必须与策略中 oidc:aud 一致（且身份提供商客户端 ID 已注册）');
+    error('  - sub 必须能被策略中 oidc:sub 的通配符匹配');
+    throw new Error(`STS auth failed (${res.status})${code ? ' [' + code + ']' : ''}: ${msg || '未知错误'}`);
+  }
+
+  const cred = res.data.credentials;
+  if (!cred || !cred.access_key_id || !cred.secret_access_key || !cred.security_token) {
+    error(`STS 响应体 : ${maskBody(res.data)}`);
+    throw new Error('STS auth failed: 响应中缺少临时凭证字段');
+  }
+
+  const expiresAt = new Date(cred.expiration).getTime();
+  info(`-- 临时凭证获取成功：AK ${mask(cred.access_key_id)}，有效期约 ${Math.max(0, Math.round((expiresAt - Date.now()) / 1000))} 秒 --`);
+  debug('=== 步骤3：成功获取临时安全凭证 ===');
+  debug(`SecurityToken    : ${mask(cred.security_token, 10, 10)}`);
+  debug(`凭证过期时间     : ${cred.expiration}`);
+
+  const result = {
+    accessKeyId: cred.access_key_id,
+    secretAccessKey: cred.secret_access_key,
+    securityToken: cred.security_token,
+    expiresAt,
+    expiresAtISO: cred.expiration
+  };
+  _credentials = result;
+  _credentialPromise = null;
+  return result;
+}
+
+/**
+ * 换取临时凭证（带并发去重：同一时刻只发起一次 STS 换证，其余等待同一结果）。
+ * @returns {Promise<Object>} 同 _assumeAgencyWithOIDC 返回
+ */
+async function _exchangeCredentials() {
+  if (_credentialPromise) {
+    debug('-- 检测到进行中的换证请求，复用同一结果（并发去重）--');
+    return _credentialPromise;
+  }
+  _credentialPromise = _assumeAgencyWithOIDC();
+  try {
+    return await _credentialPromise;
+  } catch (err) {
+    _credentialPromise = null;
+    error(`-- OIDC 免密换证失败：${err.message} --`);
+    throw err;
+  }
+}
+
+module.exports = { getCredentials };
+
+
+/***/ }),
+
+/***/ 5531:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+/**
+ * HTTP 请求工具模块：sendRequest 发送请求并解析 JSON 响应。
+ * 基于 Node 内置 fetch（Node 18+），零第三方依赖。
+ * 调试模式打印完整请求/响应日志（敏感字段自动脱敏），非调试模式不打印请求详情。
+ */
+
+const { debug, maskHeaders, maskBody, clip } = __nccwpck_require__(9463);
+
+// Node 18+ 有内置全局 fetch；在只支持 node16 运行时的 CI 平台（如 GitCode Action）下
+// 回退到 undici（作为 Action 产物时由 @actions/core 的传递依赖随 ncc 一并内联）。
+// 运行时动态判断而非模块加载时固化，保证测试拦截器替换全局 fetch 后仍生效。
+
+/**
+ * 发送 HTTPS 请求并解析 JSON 响应（通用基础能力，供调用 APIG 等接口使用）。
+ * 调试模式（configure({ debug: true })）下打印完整请求/响应日志，敏感字段自动脱敏。
+ * @param {string} method  HTTP 方法（GET/POST/...）
+ * @param {string} url     完整 URL（https://{host}{path}[?query]）
+ * @param {Object} [headers] 请求头
+ * @param {string|Buffer} [body] 请求体（字符串或二进制 Buffer，均可选）
+ * @returns {Promise<{status: number, headers: Object, data: Object|string}>}
+ *          JSON 解析失败时 data = { raw }
+ */
+async function sendRequest(method, url, headers, body) {
+  debug(`--> ${String(method).toUpperCase()} ${url}`);
+  debug(`--> 请求头: ${JSON.stringify(maskHeaders(headers))}`);
+  if (body !== undefined && body !== null && body !== '') {
+    debug(`--> 请求体: ${_describeBody(body)}`);
+  }
+
+  let res;
+  try {
+    const fetchImpl = typeof fetch === 'function' ? fetch : (...args) => (__nccwpck_require__(6752).fetch)(...args);
+    res = await fetchImpl(url, {
+      method,
+      headers,
+      body: body || undefined
+    });
+  } catch (err) {
+    throw new Error(`网络请求失败 ${method} ${url}: ${err.message}`);
+  }
+
+  const raw = await res.text();
+  debug(`<-- HTTP 状态码: ${res.status}`);
+  debug(`<-- 响应头: ${JSON.stringify(_headersToObject(res.headers))}`);
+  debug(`<-- 响应体: ${raw ? clip(maskBody(raw)) : '(空)'}`);
+
+  let data = {};
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      data = { raw };
+    }
+  }
+  return { status: res.status, headers: _headersToObject(res.headers), data };
+}
+
+/**
+ * 调试日志的请求体描述：二进制按类型与长度描述（不读内容），字符串/普通对象脱敏后截断，
+ * 避免大体积或非文本内容拖慢处理、刷屏或序列化异常。
+ */
+function _describeBody(body) {
+  if (typeof body === 'string') return clip(maskBody(body));
+  if (Buffer.isBuffer(body) || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    return `(二进制，${body.byteLength ?? body.length} 字节)`;
+  }
+  try {
+    return clip(maskBody(JSON.stringify(body)));
+  } catch (e) {
+    return '(对象，无法序列化)';
+  }
+}
+
+/** 将 fetch 的 Headers 对象转换为普通对象。 */
+function _headersToObject(headers) {
+  const out = {};
+  headers.forEach((value, key) => {
+    out[key] = value;
+  });
+  return out;
+}
+
+module.exports = { sendRequest };
+
+
+/***/ }),
+
+/***/ 6239:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+/**
+ * @openlibing/huaweicloud-oidc-client：openlibing 平台与华为云的交互 SDK（npm 包入口）
+ *
+ * 本包封装 openlibing 平台对接华为云的通用基础能力：
+ *   1. OIDC 认证：getCredentials() 获取华为云临时凭证（AK/SK/SecurityToken），调用链为
+ *      CI 流水线 OIDC ID Token（GitHub Actions / GitCode Actions 等 Actions 兼容平台，
+ *      audience = huawei-cloud-service）-> 华为云 STS AssumeAgencyWithOIDC 换证，带缓存
+ *      自动刷新、force 强制刷新、并发去重；OIDC 提供商取 configure() 配置值。
+ *   2. APIG 调用：callApig() 一行调用 APIG 接口（自动换证 + V11 签名 + X-Security-Token）；
+ *      V11Signer 对 APIG 请求做 V11-HMAC-SHA256 签名（严格复刻华为云官方 APIG Python SDK
+ *      的 V11 算法，仅适用于 APIG 网关，作用域服务名固定为 apic），供精细控制场景使用。
+ *   3. HTTPS 请求工具：sendRequest() 发送请求并解析 JSON 响应，供调用 APIG 等接口使用。
+ *
+ * 设计边界：OBS 上传等业务逻辑由使用方基于本 SDK 提供的临时凭证自行实现（OBS 使用自身签名协议）。
+ *
+ * 日志分级：info 关键步骤成功日志（OIDC Token 申请、换证步骤等）与 error 关键步骤失败日志（失败原因、排查
+ * 提示等，输出到 stderr）任何模式下均打印；debug 调试定位日志（每次 HTTP 请求的请求行、请求头、
+ * 请求体与响应状态码、响应头、响应体、OIDC Token 声明等，敏感字段自动脱敏）通过
+ * configure({ debug: true }) 开启，默认关闭。
+ *
+ * 仅依赖 Node 内置模块（https / crypto / url），不依赖 @actions/core；OIDC Token 通过
+ * Actions 兼容流水线（GitHub / GitCode Actions）注入的环境变量自包含申请，任意 Node 环境均可独立使用。
+ *
+ * 模块结构（src/）：
+ *   config.js       内置配置 + configure() 覆盖（模块级单例 cfg）
+ *   logger.js       分级日志（info 关键步骤 / debug 调试定位 / error 失败详情）+ 敏感字段脱敏工具
+ *   http.js         sendRequest HTTPS 请求工具（调试模式打印请求/响应详情）
+ *   oidc.js         OIDC ID Token 申请（GitHub / GitCode Actions 等 Actions 兼容流水线自申请 / 环境变量注入）
+ *   credentials.js  getCredentials：OIDC -> STS 换证（缓存 / force / 并发去重）
+ *   signer-v11.js   V11Signer：APIG V11-HMAC-SHA256 签名器
+ *   apig.js         callApig：一行调用 APIG（自动换证 + V11 签名 + X-Security-Token）
+ *
+ * 用法：
+ *   const openlibing = require('@openlibing/huaweicloud-oidc-client');
+ *
+ *   // 开启调试定位日志（额外打印请求/响应详情等，敏感字段脱敏；关键步骤日志默认已打印）
+ *   openlibing.configure({ debug: true });
+ *
+ *   // 覆盖内置 openlibing 配置（换账号/区域等）
+ *   openlibing.configure({ accountId: 'xxx', region: 'cn-north-4' });
+ *
+ *   // 1) 一行调用 APIG（自动换证 + V11 签名 + X-Security-Token）
+ *   const res = await openlibing.callApig('GET', 'https://{apig-host}/v1/export');
+ *   // => { status, headers, data }
+ *
+ *   // 2) OIDC 认证：获取临时凭证（供 OBS 上传等场景自行使用）
+ *   const cred = await openlibing.getCredentials();
+ *   // => { accessKeyId, secretAccessKey, securityToken, expiresAt, expiresIn }
+ *
+ *   // 强制刷新
+ *   const fresh = await openlibing.getCredentials({ force: true });
+ *
+ *   // 3) 精细控制：自行组合 V11 签名与 HTTPS 请求
+ *   const signer = new openlibing.V11Signer({ region: 'cn-southwest-2' });
+ *   signer.Key = cred.accessKeyId;
+ *   signer.Secret = cred.secretAccessKey;
+ *   const headers = signer.sign('GET', 'https://{apig-host}/v1/export', {}, '');
+ *   const res2 = await openlibing.sendRequest('GET', 'https://{apig-host}/v1/export', headers, '');
+ */
+
+module.exports = {
+  callApig: (__nccwpck_require__(578).callApig),
+  getCredentials: (__nccwpck_require__(6477).getCredentials),
+  configure: (__nccwpck_require__(3298).configure),
+  V11Signer: (__nccwpck_require__(9692).V11Signer),
+  sendRequest: (__nccwpck_require__(5531).sendRequest)
+};
+
+
+/***/ }),
+
+/***/ 9463:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+/**
+ * 日志与脱敏模块：分级日志（info 关键步骤 / debug 调试定位 / error 失败详情）+ 敏感字段脱敏工具。
+ * 各级别日志均带 [INFO] / [DEBUG] / [ERROR] 前缀与 ISO 8601 UTC 时间戳，便于肉眼区分、排序与按级别检索。
+ */
+
+const { cfg } = __nccwpck_require__(3298);
+
+/** 当前时间戳（ISO 8601 UTC，如 2026-08-28T12:03:54.123Z）。 */
+function ts() {
+  return new Date().toISOString();
+}
+
+/** 关键步骤日志（info 级）：任何模式下均打印（普通 Node 环境使用 console.log，不依赖 @actions/core）。 */
+function info(msg) {
+  console.log(`[INFO] ${ts()} ${msg}`);
+}
+
+/** 调试日志（debug 级）：仅在调试模式（configure({ debug: true })）下打印，用于请求/响应详情等定位信息。 */
+function debug(msg) {
+  if (cfg.debug) {
+    console.log(`[DEBUG] ${ts()} ${msg}`);
+  }
+}
+
+/** 错误日志（error 级）：任何模式下均打印，输出到 stderr（失败详情、排查提示等），便于与正常日志区分。 */
+function error(msg) {
+  console.error(`[ERROR] ${ts()} ${msg}`);
+}
+
+/** 脱敏：仅保留首尾若干字符，中间用 * 代替。 */
+function mask(value, head = 6, tail = 4) {
+  if (!value) return '(空)';
+  const s = String(value);
+  if (s.length <= head + tail) return s.slice(0, 2) + '***' + s.slice(-2);
+  return s.slice(0, head) + '***' + s.slice(-tail) + `（长度 ${s.length}）`;
+}
+
+/** 调试日志中需要脱敏的字段名（请求头字段与 JSON 字段名，小写比较）。 */
+const SENSITIVE_KEYS = [
+  'authorization', 'x-security-token', 'x-auth-token', 'password', 'secret',
+  'id_token', 'access_key_id', 'secret_access_key', 'security_token',
+  'accesskeyid', 'secretaccesskey', 'securitytoken', 'client_secret'
+];
+
+/** JWT 特征（三段 base64url，以 eyJ 开头），用于在任意文本中识别并脱敏令牌。 */
+const JWT_RE = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+
+/** 文本脱敏：将其中的 JWT 令牌整体脱敏。 */
+function maskText(text) {
+  return String(text).replace(JWT_RE, (m) => mask(m, 20, 10));
+}
+
+/** 深度脱敏 JSON 结构：敏感字段名直接脱敏，其余字段递归处理（字符串再做 JWT 识别）。 */
+function maskDeep(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return maskText(value);
+  if (Array.isArray(value)) return value.map(maskDeep);
+  if (typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value)) {
+      out[k] = SENSITIVE_KEYS.includes(k.toLowerCase()) ? mask(value[k]) : maskDeep(value[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** 请求头脱敏：敏感头字段值脱敏，其余原样。 */
+function maskHeaders(headers) {
+  const out = {};
+  for (const k of Object.keys(headers || {})) {
+    out[k] = SENSITIVE_KEYS.includes(k.toLowerCase()) ? mask(headers[k]) : headers[k];
+  }
+  return out;
+}
+
+/** 请求体/响应体脱敏：JSON 结构做深度脱敏，非 JSON 文本做 JWT 识别脱敏。 */
+function maskBody(body) {
+  const s = typeof body === 'string' ? body : JSON.stringify(body);
+  try {
+    return JSON.stringify(maskDeep(JSON.parse(s)));
+  } catch (e) {
+    return maskText(s);
+  }
+}
+
+/** 调试日志体积保护：超长文本截断，避免大体积请求/响应体拖慢处理或刷屏。 */
+function clip(text, max = 4096) {
+  const s = String(text);
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}…（截断，总长 ${s.length} 字符）`;
+}
+
+module.exports = { info, debug, error, mask, maskText, maskDeep, maskHeaders, maskBody, clip, SENSITIVE_KEYS };
+
+
+/***/ }),
+
+/***/ 8790:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+/**
+ * OIDC 模块：申请 CI 流水线签发的 OIDC ID Token（自包含，不依赖 @actions/core）。
+ * 支持 GitHub Actions、GitCode Actions 等 Actions 兼容流水线：两者签发 OIDC ID Token 的方式
+ * 一致，均通过运行时注入的 ACTIONS_ID_TOKEN_REQUEST_URL / ACTIONS_ID_TOKEN_REQUEST_TOKEN
+ * 环境变量申请（GitCode Actions 流水线与 GitHub Actions 运行器协议兼容）。
+ */
+
+const { cfg } = __nccwpck_require__(3298);
+const { info, error } = __nccwpck_require__(9463);
+const { sendRequest } = __nccwpck_require__(5531);
+
+/** 申请 OIDC ID Token（自包含，不依赖 @actions/core，GitHub / GitCode Actions 流水线均适用）。 */
+async function getOidcToken() {
+  const fromEnv = process.env.HUAWEICLOUD_OIDC_TOKEN;
+  if (fromEnv) {
+    info('-- OIDC ID Token 获取成功：来自环境变量 HUAWEICLOUD_OIDC_TOKEN 注入 --');
+    return fromEnv;
+  }
+  const fromActions = await getOidcTokenFromActions();
+  if (fromActions) {
+    info('-- OIDC ID Token 申请成功（Actions 兼容流水线 OIDC 接口）--');
+    return fromActions;
+  }
+  error('-- OIDC ID Token 申请失败：缺少 ACTIONS_ID_TOKEN_REQUEST_URL / ACTIONS_ID_TOKEN_REQUEST_TOKEN 环境变量 --');
+  throw new Error(
+    '无法申请 OIDC ID Token：缺少 ACTIONS_ID_TOKEN_REQUEST_URL/ACTIONS_ID_TOKEN_REQUEST_TOKEN。' +
+    '请确认流水线（GitHub Actions / GitCode Actions 等兼容平台）已声明 permissions: id-token: write，' +
+    '或设置环境变量 HUAWEICLOUD_OIDC_TOKEN 直接注入令牌。'
+  );
+}
+
+/**
+ * 通过 Actions 兼容流水线（GitHub Actions / GitCode Actions）注入的环境变量自行申请 OIDC ID Token。
+ * 与 @actions/core 的 getIDToken 实现一致：向 ACTIONS_ID_TOKEN_REQUEST_URL 发起
+ * GET 请求并携带 audience 查询参数，Authorization 头使用 ACTIONS_ID_TOKEN_REQUEST_TOKEN。
+ * @returns {Promise<string|null>}
+ */
+async function getOidcTokenFromActions() {
+  const reqUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const reqToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  if (!reqUrl || !reqToken) {
+    return null;
+  }
+  const url = new URL(reqUrl);
+  url.searchParams.append('audience', cfg.audience);
+  const res = await sendRequest('GET', url.toString(), {
+    Authorization: `Bearer ${reqToken}`,
+    'Content-Type': 'application/json',
+    'User-Agent': 'OpenlibingClient/1.0'
+  }, '');
+  if (res.status !== 200 || !res.data || !res.data.value) {
+    error(`OIDC Token 申请失败（HTTP ${res.status}）: ${JSON.stringify(res.data)}`);
+    return null;
+  }
+  return res.data.value;
+}
+
+module.exports = { getOidcToken };
+
+
+/***/ }),
+
+/***/ 9692:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+/**
+ * APIG V11-HMAC-SHA256 签名模块（严格复刻华为云官方 APIG Python SDK 的 V11 算法）。
+ * 仅适用于 APIG 网关接口，签名作用域服务名固定为 apic。
+ */
+
+const crypto = __nccwpck_require__(6982);
+
+const EMPTY_BODY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+const APIC_SERVICE = 'apic';
+
+// 与官方 noEscape 一致的字符表：不可编码字符（字母数字和 - _ . ~）为 1
+const noEscape = [
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1,
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 0
+];
+
+const hexTable = [];
+for (let i = 0; i < 256; ++i) {
+  hexTable[i] = '%' + ((i < 16 ? '0' : '') + i.toString(16)).toUpperCase();
+}
+
+/** 官方 urlencode 实现（quote(str, safe='~')）。 */
+function urlEncode(str) {
+  if (typeof str !== 'string') {
+    str = str == null ? '' : String(str);
+  }
+  let out = '';
+  let lastPos = 0;
+  for (let i = 0; i < str.length; ++i) {
+    const c = str.charCodeAt(i);
+    if (c < 0x80) {
+      if (noEscape[c] === 1) continue;
+      if (lastPos < i) out += str.slice(lastPos, i);
+      lastPos = i + 1;
+      out += hexTable[c];
+      continue;
+    }
+    if (lastPos < i) out += str.slice(lastPos, i);
+    if (c < 0x800) {
+      lastPos = i + 1;
+      out += hexTable[0xC0 | (c >> 6)] + hexTable[0x80 | (c & 0x3F)];
+      continue;
+    }
+    if (c < 0xD800 || c >= 0xE000) {
+      lastPos = i + 1;
+      out += hexTable[0xE0 | (c >> 12)] +
+        hexTable[0x80 | ((c >> 6) & 0x3F)] +
+        hexTable[0x80 | (c & 0x3F)];
+      continue;
+    }
+    ++i;
+    if (i >= str.length) throw new Error('ERR_INVALID_URI');
+    const c2 = str.charCodeAt(i) & 0x3FF;
+    lastPos = i + 1;
+    const cFull = 0x10000 + (((c & 0x3FF) << 10) | c2);
+    out += hexTable[0xF0 | (cFull >> 18)] +
+      hexTable[0x80 | ((cFull >> 12) & 0x3F)] +
+      hexTable[0x80 | ((cFull >> 6) & 0x3F)] +
+      hexTable[0x80 | (cFull & 0x3F)];
+  }
+  if (lastPos === 0) return str;
+  if (lastPos < str.length) return out + str.slice(lastPos);
+  return out;
+}
+
+/** CanonicalURI：路径按 '/' 分段逐段编码后拼接，末尾补 '/'。 */
+function canonicalURI(pathname) {
+  const input = pathname || '';
+  const uriList = input.split('/');
+  const uri = uriList.map((seg) => urlEncode(seg));
+  let urlpath = uri.join('/');
+  if (urlpath[urlpath.length - 1] !== '/') {
+    urlpath = urlpath + '/';
+  }
+  return urlpath;
+}
+
+/** CanonicalQueryString：查询参数按键排序，值排序后拼接。 */
+function canonicalQueryString(searchParams) {
+  const keys = [];
+  for (const key of searchParams.keys()) keys.push(key);
+  keys.sort();
+  const arr = [];
+  for (const key of keys) {
+    const ke = urlEncode(key);
+    const values = searchParams.getAll(key);
+    values.sort();
+    for (const v of values) {
+      arr.push(ke + '=' + urlEncode(v));
+    }
+  }
+  return arr.join('&');
+}
+
+/**
+ * CanonicalHeaders：按 signed headers 顺序，name:value\n（value 去首尾空格）。
+ * 注意：allHeaders 的 key 可能保留原始大小写，因此先构建小写 key 的查找表，
+ * 否则会取到 undefined，导致规范请求错误、签名不匹配（表现为 APIG.0602 等）。
+ */
+function canonicalHeaders(allHeaders, signedHeaders) {
+  const normalized = {};
+  for (const k of Object.keys(allHeaders)) {
+    normalized[k.toLowerCase()] = allHeaders[k];
+  }
+  const arr = [];
+  for (const k of signedHeaders) {
+    arr.push(k + ':' + String(normalized[k]).trim());
+  }
+  return arr.join('\n') + '\n';
+}
+
+/** sha256 hex。 */
+function sha256Hex(str) {
+  return crypto.createHash('sha256').update(str, 'utf8').digest('hex');
+}
+
+/** hmac-sha256 hex。 */
+function hmacSha256Hex(key, str) {
+  return crypto.createHmac('sha256', key).update(str, 'utf8').digest('hex');
+}
+
+/**
+ * HKDF-SHA256 派生密钥，返回 hex 字符串。
+ * 严格对齐官方 signer_v11.py 的 _hkdf：salt = AK，ikm = SK，info = credential_scope。
+ */
+function hkdfGetDerKeySha256(accessKey, secretKey, credentialScope) {
+  const salt = Buffer.from(accessKey, 'utf8');
+  const ikm = Buffer.from(secretKey, 'utf8');
+  const info = Buffer.from(credentialScope, 'utf8');
+  const prk = crypto.createHmac('sha256', salt).update(ikm).digest();
+  let okm = Buffer.alloc(0);
+  let t = Buffer.alloc(0);
+  const length = 32;
+  const rounds = Math.ceil((length + 32) / 32);
+  for (let i = 1; i <= rounds; ++i) {
+    const newInfo = Buffer.concat([t, info, Buffer.from([i])]);
+    t = crypto.createHmac('sha256', prk).update(newInfo).digest();
+    okm = Buffer.concat([okm, t], okm.length + t.length);
+  }
+  return okm.slice(0, length).toString('hex').toLowerCase();
+}
+
+/** 当前 GMT 时间，格式 YYYYMMDDTHHMMSSZ。 */
+function getTime() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return (
+    d.getUTCFullYear() +
+    pad(d.getUTCMonth() + 1) +
+    pad(d.getUTCDate()) +
+    'T' +
+    pad(d.getUTCHours()) +
+    pad(d.getUTCMinutes()) +
+    pad(d.getUTCSeconds()) +
+    'Z'
+  );
+}
+
+/**
+ * V11Signer：使用 AK/SK 对 APIG 请求做 V11-HMAC-SHA256 签名。
+ * 仅适用于 APIG 网关接口（签名作用域服务名固定为 apic）。
+ */
+class V11Signer {
+  constructor(options = {}) {
+    this.Key = '';
+    this.Secret = '';
+    this.region = options.region || '';
+  }
+
+  /**
+   * 对请求签名，返回签名后的完整请求头（含 Authorization / x-sdk-date / host）。
+   * @param {string} method   HTTP 方法（如 GET/POST）
+   * @param {string} url      完整 URL（https://{apig-host}{path}[?query]）
+   * @param {Object} [headers] 请求头
+   * @param {string} [body]    请求体（字符串）
+   * @returns {Object} 签名后的请求头
+   */
+  sign(method, url, headers = {}, body = '') {
+    const parsedUrl = new URL(url);
+
+    const allHeaders = {};
+    for (const k of Object.keys(headers)) allHeaders[k] = headers[k];
+    if (!Object.keys(allHeaders).some((k) => k.toLowerCase() === 'x-sdk-date')) {
+      allHeaders['x-sdk-date'] = getTime();
+    }
+    if (!Object.keys(allHeaders).some((k) => k.toLowerCase() === 'host')) {
+      allHeaders['host'] = parsedUrl.host;
+    }
+
+    const signedHeaders = Object.keys(allHeaders)
+      .map((k) => k.toLowerCase())
+      .sort();
+
+    const canonicalURIStr = canonicalURI(parsedUrl.pathname);
+    const canonicalQueryStringStr = canonicalQueryString(parsedUrl.searchParams);
+    const canonicalHeadersStr = canonicalHeaders(allHeaders, signedHeaders);
+    const payloadHash = body ? sha256Hex(body) : EMPTY_BODY_SHA256;
+
+    const canonicalRequest = [
+      method.toUpperCase(),
+      canonicalURIStr,
+      canonicalQueryStringStr,
+      canonicalHeadersStr,
+      signedHeaders.join(';'),
+      payloadHash
+    ].join('\n');
+
+    const canonicalRequestHash = sha256Hex(canonicalRequest);
+
+    const time = allHeaders['x-sdk-date'];
+    const formattedDate = time.substring(0, 8);
+    const credentialScope = formattedDate + '/' + this.region + '/' + APIC_SERVICE;
+
+    const stringToSign =
+      'V11-HMAC-SHA256\n' +
+      time + '\n' +
+      credentialScope + '\n' +
+      canonicalRequestHash;
+
+    const realUseSecret = hkdfGetDerKeySha256(this.Key, this.Secret, credentialScope);
+    const signature = hmacSha256Hex(realUseSecret, stringToSign);
+
+    allHeaders['Authorization'] =
+      'V11-HMAC-SHA256 Credential=' + this.Key + '/' + credentialScope +
+      ', SignedHeaders=' + signedHeaders.join(';') +
+      ', Signature=' + signature;
+
+    return allHeaders;
+  }
+}
+
+module.exports = { V11Signer };
+
 
 /***/ }),
 
