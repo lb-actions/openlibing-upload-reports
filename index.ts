@@ -168,7 +168,7 @@ function validateArchivePath(archivePath: string): string {
  * Fetch job ID from GitHub API.
  * Returns the first job ID from the current workflow run.
  */
-async function fetchJobIdFromGitHub(githubToken: string): Promise<string> {
+async function fetchJobIdFromGitHub(githubToken?: string): Promise<string> {
   const githubRunId = process.env.GITHUB_RUN_ID;
   const githubRepository = process.env.GITHUB_REPOSITORY;
 
@@ -181,14 +181,39 @@ async function fetchJobIdFromGitHub(githubToken: string): Promise<string> {
 
   console.log(`Fetching job ID from GitHub API: ${url}`);
 
-  const response = await axios.get(url, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${githubToken}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "Node.js-axios/1.6.0",
-    },
-  });
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "Node.js-axios/1.6.0",
+  };
+  if (githubToken) {
+    headers.Authorization = `Bearer ${githubToken}`;
+  } else {
+    console.log(
+      "github-token not provided, calling GitHub API unauthenticated " +
+        "(public repos only, 60 req/hour per IP)"
+    );
+  }
+
+  let response;
+  try {
+    response = await axios.get(url, { headers });
+  } catch (error: any) {
+    const status = error?.response?.status;
+    const rateLimitRemaining = error?.response?.headers?.["x-ratelimit-remaining"];
+    const rateLimitLimit = error?.response?.headers?.["x-ratelimit-limit"];
+    const body = error?.response?.data;
+    console.error(
+      `GitHub API request failed: status=${status}, ` +
+        `x-ratelimit-remaining=${rateLimitRemaining}/${rateLimitLimit}, ` +
+        `authenticated=${githubToken ? "yes" : "no"}`
+    );
+    console.error(`Response body: ${JSON.stringify(body)}`);
+    throw new Error(
+      `GitHub API request to ${url} failed with status ${status}: ` +
+        `${JSON.stringify(body?.message || body)}`
+    );
+  }
 
   const jobs = response.data.jobs;
   if (!jobs || jobs.length === 0) {
@@ -204,7 +229,7 @@ async function fetchJobIdFromGitHub(githubToken: string): Promise<string> {
  * Fetch workflow ID from GitHub API.
  * Returns the workflow_id from the current workflow run.
  */
-async function fetchWorkflowIdFromGitHub(githubToken: string): Promise<string> {
+async function fetchWorkflowIdFromGitHub(githubToken?: string): Promise<string> {
   const githubRunId = process.env.GITHUB_RUN_ID;
   const githubRepository = process.env.GITHUB_REPOSITORY;
 
@@ -217,14 +242,39 @@ async function fetchWorkflowIdFromGitHub(githubToken: string): Promise<string> {
 
   console.log(`Fetching workflow ID from GitHub API: ${url}`);
 
-  const response = await axios.get(url, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${githubToken}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "Node.js-axios/1.6.0",
-    },
-  });
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "Node.js-axios/1.6.0",
+  };
+  if (githubToken) {
+    headers.Authorization = `Bearer ${githubToken}`;
+  } else {
+    console.log(
+      "github-token not provided, calling GitHub API unauthenticated " +
+        "(public repos only, 60 req/hour per IP)"
+    );
+  }
+
+  let response;
+  try {
+    response = await axios.get(url, { headers });
+  } catch (error: any) {
+    const status = error?.response?.status;
+    const rateLimitRemaining = error?.response?.headers?.["x-ratelimit-remaining"];
+    const rateLimitLimit = error?.response?.headers?.["x-ratelimit-limit"];
+    const body = error?.response?.data;
+    console.error(
+      `GitHub API request failed: status=${status}, ` +
+        `x-ratelimit-remaining=${rateLimitRemaining}/${rateLimitLimit}, ` +
+        `authenticated=${githubToken ? "yes" : "no"}`
+    );
+    console.error(`Response body: ${JSON.stringify(body)}`);
+    throw new Error(
+      `GitHub API request to ${url} failed with status ${status}: ` +
+        `${JSON.stringify(body?.message || body)}`
+    );
+  }
 
   const workflowId = response.data.workflow_id;
   if (!workflowId) {
@@ -258,6 +308,8 @@ async function uploadFiles(
 
   const boundary = "----OpenLibingUpload" + Math.random().toString(16).slice(2);
   const fields: Record<string, string> = {};
+  // Fixed platform identifier sent alongside the files
+  fields.platform = "github";
   if (workflowId) {
     fields.pipelineId = workflowId;
   }
@@ -347,14 +399,17 @@ async function run(): Promise<void> {
       pipelineRunId = null;
       jobId = null;
     } else {
-      // Pipeline mode: use GITHUB_RUN_ID and fetch IDs from API
-      const githubToken = core.getInput("github-token", { required: true });
+      // Pipeline mode: use GITHUB_RUN_ID as the run id; resolve workflow/job
+      // IDs via GitHub API. When github-token is provided, authenticate the
+      // request (higher rate limit, private repos). When not provided, call
+      // the API unauthenticated (public repos only, 60 req/hour per IP).
+      const githubToken = core.getInput("github-token", { required: false });
       pipelineRunId = process.env.GITHUB_RUN_ID || null;
       if (!pipelineRunId) {
         throw new Error("GITHUB_RUN_ID environment variable not set");
       }
-      workflowId = await fetchWorkflowIdFromGitHub(githubToken);
-      jobId = await fetchJobIdFromGitHub(githubToken);
+      workflowId = await fetchWorkflowIdFromGitHub(githubToken || undefined);
+      jobId = await fetchJobIdFromGitHub(githubToken || undefined);
     }
 
     const files = filesInput.split(/\s+/).filter((f) => f.length > 0);
@@ -379,7 +434,8 @@ async function run(): Promise<void> {
       }
 
       if (!isLabelMode) {
-        // Pipeline mode validation
+        // Pipeline mode validation: workflow-id, pipeline-run-id and job-id
+        // are all required (resolved via GitHub API)
         if (!workflowId || !pipelineRunId || !jobId) {
           core.error(
             "Pipeline mode requires workflow-id, pipeline-run-id and job-id"
