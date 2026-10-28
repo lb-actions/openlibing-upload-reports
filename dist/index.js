@@ -159,14 +159,34 @@ async function fetchJobIdFromGitHub(githubToken) {
     const [owner, repo] = githubRepository.split("/");
     const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${githubRunId}/jobs`;
     console.log(`Fetching job ID from GitHub API: ${url}`);
-    const response = await axios_1.default.get(url, {
-        headers: {
-            Accept: "application/vnd.github+json",
-            Authorization: `Bearer ${githubToken}`,
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "Node.js-axios/1.6.0",
-        },
-    });
+    const headers = {
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Node.js-axios/1.6.0",
+    };
+    if (githubToken) {
+        headers.Authorization = `Bearer ${githubToken}`;
+    }
+    else {
+        console.log("github-token not provided, calling GitHub API unauthenticated " +
+            "(public repos only, 60 req/hour per IP)");
+    }
+    let response;
+    try {
+        response = await axios_1.default.get(url, { headers });
+    }
+    catch (error) {
+        const status = error?.response?.status;
+        const rateLimitRemaining = error?.response?.headers?.["x-ratelimit-remaining"];
+        const rateLimitLimit = error?.response?.headers?.["x-ratelimit-limit"];
+        const body = error?.response?.data;
+        console.error(`GitHub API request failed: status=${status}, ` +
+            `x-ratelimit-remaining=${rateLimitRemaining}/${rateLimitLimit}, ` +
+            `authenticated=${githubToken ? "yes" : "no"}`);
+        console.error(`Response body: ${JSON.stringify(body)}`);
+        throw new Error(`GitHub API request to ${url} failed with status ${status}: ` +
+            `${JSON.stringify(body?.message || body)}`);
+    }
     const jobs = response.data.jobs;
     if (!jobs || jobs.length === 0) {
         throw new Error("No jobs found in the current workflow run");
@@ -188,14 +208,34 @@ async function fetchWorkflowIdFromGitHub(githubToken) {
     const [owner, repo] = githubRepository.split("/");
     const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${githubRunId}`;
     console.log(`Fetching workflow ID from GitHub API: ${url}`);
-    const response = await axios_1.default.get(url, {
-        headers: {
-            Accept: "application/vnd.github+json",
-            Authorization: `Bearer ${githubToken}`,
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "Node.js-axios/1.6.0",
-        },
-    });
+    const headers = {
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Node.js-axios/1.6.0",
+    };
+    if (githubToken) {
+        headers.Authorization = `Bearer ${githubToken}`;
+    }
+    else {
+        console.log("github-token not provided, calling GitHub API unauthenticated " +
+            "(public repos only, 60 req/hour per IP)");
+    }
+    let response;
+    try {
+        response = await axios_1.default.get(url, { headers });
+    }
+    catch (error) {
+        const status = error?.response?.status;
+        const rateLimitRemaining = error?.response?.headers?.["x-ratelimit-remaining"];
+        const rateLimitLimit = error?.response?.headers?.["x-ratelimit-limit"];
+        const body = error?.response?.data;
+        console.error(`GitHub API request failed: status=${status}, ` +
+            `x-ratelimit-remaining=${rateLimitRemaining}/${rateLimitLimit}, ` +
+            `authenticated=${githubToken ? "yes" : "no"}`);
+        console.error(`Response body: ${JSON.stringify(body)}`);
+        throw new Error(`GitHub API request to ${url} failed with status ${status}: ` +
+            `${JSON.stringify(body?.message || body)}`);
+    }
     const workflowId = response.data.workflow_id;
     if (!workflowId) {
         throw new Error("workflow_id not found in the response");
@@ -220,6 +260,8 @@ async function uploadFiles(files, uploadConfig) {
     console.log(`URL: ${url}`);
     const boundary = "----OpenLibingUpload" + Math.random().toString(16).slice(2);
     const fields = {};
+    // Fixed platform identifier sent alongside the files
+    fields.platform = "github";
     if (workflowId) {
         fields.pipelineId = workflowId;
     }
@@ -298,14 +340,17 @@ async function run() {
             jobId = null;
         }
         else {
-            // Pipeline mode: use GITHUB_RUN_ID and fetch IDs from API
-            const githubToken = core.getInput("github-token", { required: true });
+            // Pipeline mode: use GITHUB_RUN_ID as the run id; resolve workflow/job
+            // IDs via GitHub API. When github-token is provided, authenticate the
+            // request (higher rate limit, private repos). When not provided, call
+            // the API unauthenticated (public repos only, 60 req/hour per IP).
+            const githubToken = core.getInput("github-token", { required: false });
             pipelineRunId = process.env.GITHUB_RUN_ID || null;
             if (!pipelineRunId) {
                 throw new Error("GITHUB_RUN_ID environment variable not set");
             }
-            workflowId = await fetchWorkflowIdFromGitHub(githubToken);
-            jobId = await fetchJobIdFromGitHub(githubToken);
+            workflowId = await fetchWorkflowIdFromGitHub(githubToken || undefined);
+            jobId = await fetchJobIdFromGitHub(githubToken || undefined);
         }
         const files = filesInput.split(/\s+/).filter((f) => f.length > 0);
         console.log("Input parameters loaded:");
@@ -325,7 +370,8 @@ async function run() {
                 throw new Error("archive-path requires label");
             }
             if (!isLabelMode) {
-                // Pipeline mode validation
+                // Pipeline mode validation: workflow-id, pipeline-run-id and job-id
+                // are all required (resolved via GitHub API)
                 if (!workflowId || !pipelineRunId || !jobId) {
                     core.error("Pipeline mode requires workflow-id, pipeline-run-id and job-id");
                     throw new Error("Pipeline mode requires workflow-id, pipeline-run-id and job-id");
@@ -3622,7 +3668,13 @@ async function callApig(method, url, headers, body, opts = {}) {
   const signer = new V11Signer({ region: opts.region || cfg.region });
   signer.Key = cred.accessKeyId;
   signer.Secret = cred.secretAccessKey;
-  const mergedHeaders = { 'Content-Type': 'application/json', ...(headers || {}) };
+  // 大小写不敏感地检查用户是否已设置 Content-Type，避免默认 application/json 与用户传入的
+  // content-type（大小写不同）共存导致规范请求重复头、签名校验失败（APIG.0301）
+  const hasContentType = headers && Object.keys(headers).some((k) => k.toLowerCase() === 'content-type');
+  const mergedHeaders = {
+    ...(hasContentType ? {} : { 'Content-Type': 'application/json' }),
+    ...(headers || {})
+  };
   if (cred.securityToken) {
     mergedHeaders['X-Security-Token'] = cred.securityToken;
   }
@@ -4339,11 +4391,25 @@ function canonicalQueryString(searchParams) {
  * CanonicalHeaders：按 signed headers 顺序，name:value\n（value 去首尾空格）。
  * 注意：allHeaders 的 key 可能保留原始大小写，因此先构建小写 key 的查找表，
  * 否则会取到 undefined，导致规范请求错误、签名不匹配（表现为 APIG.0602 等）。
+ *
+ * 防御性检查：若同一头名以不同大小写重复出现（如 Content-Type 与 content-type），
+ * 规范化时会后值覆盖前值，签名与请求实际头不一致导致 APIG.0301 验签失败。
+ * 此处检测到重复时通过 console.warn 输出提示，便于调用方排查。
  */
 function canonicalHeaders(allHeaders, signedHeaders) {
   const normalized = {};
+  const seen = {};
+  const duplicates = [];
   for (const k of Object.keys(allHeaders)) {
-    normalized[k.toLowerCase()] = allHeaders[k];
+    const lowerK = k.toLowerCase();
+    if (seen[lowerK] && !duplicates.includes(lowerK)) {
+      duplicates.push(lowerK);
+    }
+    seen[lowerK] = true;
+    normalized[lowerK] = allHeaders[k];
+  }
+  if (duplicates.length > 0) {
+    console.warn(`[V11Signer] 检测到重复请求头（将使用最后出现的值）: ${duplicates.join(', ')}`);
   }
   const arr = [];
   for (const k of signedHeaders) {
