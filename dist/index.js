@@ -329,15 +329,29 @@ function generateRandomSuffix(length) {
     return result;
 }
 /**
- * Detect XML format by checking the root element.
+ * Extract the root element name of an XML document.
+ *
+ * Skips the XML declaration, comments, DOCTYPE, and leading whitespace, then
+ * reads the name of the first real element tag. Only the document's opening
+ * structure is inspected — we never substring-match against arbitrary body
+ * content, so a JUnit <testsuites> file that happens to contain "<metadata>"
+ * text inside a test name or message is no longer misclassified.
+ */
+function getXmlRootElement(content) {
+    const startMatch = content.match(/^\s*(?:<\?xml[\s\S]*?\?>\s*)?(?:<!--[\s\S]*?-->\s*)*(?:<!DOCTYPE[\s\S]*?>\s*)*<([a-zA-Z_][\w.-]*)/);
+    return startMatch ? startMatch[1] : null;
+}
+/**
+ * Detect XML format by checking the root element name.
  * Returns "metadata" for <metadata> root, "testsuites" for <testsuites> root,
  * or "unknown" if neither is found.
  */
 function detectXmlFormat(content) {
-    if (content.includes("<metadata>")) {
+    const root = getXmlRootElement(content);
+    if (root === "metadata") {
         return "metadata";
     }
-    if (content.includes("<testsuites")) {
+    if (root === "testsuites") {
         return "testsuites";
     }
     return "unknown";
