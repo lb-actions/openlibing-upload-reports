@@ -315,6 +315,86 @@ async function uploadFiles(files, uploadConfig) {
         data: response.data,
     };
 }
+/** Maximum size for a merged XML file (12 MB, APIG body limit). */
+const MAX_MERGE_SIZE = 12 * 1024 * 1024;
+/**
+ * Generate a random alphabetic suffix of the given length.
+ */
+function generateRandomSuffix(length) {
+    const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let result = "";
+    for (let i = 0; i < length; i++) {
+        result += chars[Math.floor(Math.random() * chars.length)];
+    }
+    return result;
+}
+/**
+ * Detect XML format by checking the root element.
+ * Returns "metadata" for <metadata> root, "testsuites" for <testsuites> root,
+ * or "unknown" if neither is found.
+ */
+function detectXmlFormat(content) {
+    if (content.includes("<metadata>")) {
+        return "metadata";
+    }
+    if (content.includes("<testsuites")) {
+        return "testsuites";
+    }
+    return "unknown";
+}
+/**
+ * Merge multiple metadata-format XML files into a single file.
+ * Combines all <testCase> nodes under one <metadata> root.
+ * Header info (pipelineId, frameType, repoUrl, etc.) is taken from the first file.
+ */
+function mergeMetadataXmls(xmlFiles, outputPath) {
+    const firstContent = fs.readFileSync(xmlFiles[0], "utf-8");
+    // Extract header: from <metadata> opening tag to <testCases> opening tag (inclusive)
+    const headerMatch = firstContent.match(/<metadata>[\s\S]*?<testCases>/);
+    const header = headerMatch ? headerMatch[0] : "<metadata>\n  <testCases>";
+    // Extract footer: from </testCases> to </metadata> (inclusive)
+    const footerMatch = firstContent.match(/<\/testCases>[\s\S]*?<\/metadata>/);
+    const footer = footerMatch ? footerMatch[0] : "</testCases>\n</metadata>";
+    // Collect all <testCase> nodes from all files
+    const allTestCases = [];
+    for (const xmlFile of xmlFiles) {
+        const content = fs.readFileSync(xmlFile, "utf-8");
+        const regex = /<testCase>[\s\S]*?<\/testCase>/g;
+        let match;
+        while ((match = regex.exec(content)) !== null) {
+            allTestCases.push(match[0]);
+        }
+    }
+    const merged = "<?xml version='1.0' encoding='utf-8'?>\n" +
+        header +
+        "\n" +
+        allTestCases.join("\n") +
+        "\n" +
+        footer +
+        "\n";
+    fs.writeFileSync(outputPath, merged, "utf-8");
+}
+/**
+ * Merge multiple testsuite-format XML files into a single file.
+ * Combines all <testsuite> nodes under one <testsuites> root.
+ */
+function mergeTestsuiteXmls(xmlFiles, outputPath) {
+    const allTestsuites = [];
+    for (const xmlFile of xmlFiles) {
+        const content = fs.readFileSync(xmlFile, "utf-8");
+        const regex = /<testsuite[\s\S]*?<\/testsuite>/g;
+        let match;
+        while ((match = regex.exec(content)) !== null) {
+            allTestsuites.push(match[0]);
+        }
+    }
+    const merged = "<?xml version='1.0' encoding='utf-8'?>\n" +
+        '<testsuites name="merged">\n' +
+        allTestsuites.join("\n") +
+        "\n" +
+        "</testsuites>\n";
+    fs.writeFileSync(outputPath, merged, "utf-8");
+}
 async function run() {
     try {
         console.log("=".repeat(60));
@@ -322,12 +402,17 @@ async function run() {
         console.log("=".repeat(60));
         // Step 1: Get input parameters
         core.startGroup("Step 1: Get input parameters");
-        const filesInput = core.getInput("files", { required: true });
+        const filesInput = core.getInput("files", { required: false });
+        const filesDirInput = core.getInput("files-dir", { required: false });
         const labelRaw = core.getInput("label", { required: false });
         const archivePathRaw = core.getInput("archive-path", { required: false });
         // Security: Validate label and archive-path parameters
         const label = validateLabel(labelRaw);
         const archivePath = validateArchivePath(archivePathRaw);
+        // Fast-fail: archive-path requires label before any file processing
+        if (Boolean(archivePath) && !label) {
+            throw new Error("archive-path requires label");
+        }
         // Determine mode: label mode or pipeline mode
         const isLabelMode = Boolean(label);
         let workflowId;
@@ -351,70 +436,160 @@ async function run() {
             }
             workflowId = await fetchWorkflowIdFromGitHub(githubToken || undefined);
             jobId = await fetchJobIdFromGitHub(githubToken || undefined);
+            // Fast-fail: pipeline mode requires all three IDs before file processing
+            if (!workflowId || !pipelineRunId || !jobId) {
+                throw new Error("Pipeline mode requires workflow-id, pipeline-run-id and job-id");
+            }
         }
-        const files = filesInput.split(/\s+/).filter((f) => f.length > 0);
+        // --- Process files parameter: individual file list ---
+        const individualFiles = [];
+        if (filesInput) {
+            individualFiles.push(...filesInput.split(/\s+/).filter((f) => f.length > 0));
+        }
+        // --- Process files-dir parameter: read XML, classify, merge ---
+        const mergedFiles = [];
+        if (filesDirInput) {
+            const validatedDir = validateFilePath(filesDirInput);
+            if (!fs.existsSync(validatedDir) ||
+                !fs.statSync(validatedDir).isDirectory()) {
+                throw new Error(`files-dir is not a valid directory: ${filesDirInput}`);
+            }
+            // Read all .xml files in the directory (non-recursive)
+            const xmlFiles = fs
+                .readdirSync(validatedDir)
+                .filter((f) => f.endsWith(".xml"))
+                .filter((f) => fs.statSync(path.join(validatedDir, f)).isFile())
+                .map((f) => path.join(validatedDir, f))
+                // Exclude previously generated merge files to avoid re-processing
+                .filter((f) => !path.basename(f).startsWith("metadata_merge_") &&
+                !path.basename(f).startsWith("test_result_"));
+            if (xmlFiles.length === 0) {
+                throw new Error(`No XML files found in files-dir: ${filesDirInput}`);
+            }
+            // Classify by root element format
+            const metadataXmls = [];
+            const testsuiteXmls = [];
+            for (const xmlFile of xmlFiles) {
+                const content = fs.readFileSync(xmlFile, "utf-8");
+                const format = detectXmlFormat(content);
+                if (format === "metadata") {
+                    metadataXmls.push(xmlFile);
+                }
+                else if (format === "testsuites") {
+                    testsuiteXmls.push(xmlFile);
+                }
+                else {
+                    core.warning(`Unknown XML format, skipping: ${xmlFile}`);
+                }
+            }
+            // Merge metadata-format XML files
+            if (metadataXmls.length > 0) {
+                const suffix = generateRandomSuffix(5);
+                const mergedFileName = `metadata_merge_${suffix}.xml`;
+                const mergedPath = path.join(validatedDir, mergedFileName);
+                mergeMetadataXmls(metadataXmls, mergedPath);
+                const mergedSize = fs.statSync(mergedPath).size;
+                if (mergedSize > MAX_MERGE_SIZE) {
+                    throw new Error(`Merged metadata file exceeds 12MB limit: ${mergedSize} bytes`);
+                }
+                mergedFiles.push(mergedPath);
+                console.log(`Merged ${metadataXmls.length} metadata XML files into ` +
+                    `${mergedFileName} (${mergedSize} bytes)`);
+            }
+            // Merge testsuite-format XML files
+            if (testsuiteXmls.length > 0) {
+                const suffix = generateRandomSuffix(5);
+                const mergedFileName = `test_result_${suffix}.xml`;
+                const mergedPath = path.join(validatedDir, mergedFileName);
+                mergeTestsuiteXmls(testsuiteXmls, mergedPath);
+                const mergedSize = fs.statSync(mergedPath).size;
+                if (mergedSize > MAX_MERGE_SIZE) {
+                    throw new Error(`Merged testsuite file exceeds 12MB limit: ${mergedSize} bytes`);
+                }
+                mergedFiles.push(mergedPath);
+                console.log(`Merged ${testsuiteXmls.length} testsuite XML files into ` +
+                    `${mergedFileName} (${mergedSize} bytes)`);
+            }
+        }
+        // At least one upload source must be provided
+        if (individualFiles.length === 0 && mergedFiles.length === 0) {
+            throw new Error("At least one of 'files' or 'files-dir' must be provided");
+        }
         console.log("Input parameters loaded:");
-        console.log(`  - files: ${files.join(", ")}`);
+        console.log(`  - files (individual): ${individualFiles.join(", ") || "(none)"}`);
+        console.log(`  - files-dir merged: ${mergedFiles.map((f) => path.basename(f)).join(", ") || "(none)"}`);
         console.log(`  - workflow-id: ${workflowId || "(not set)"}`);
         console.log(`  - pipeline-run-id: ${pipelineRunId || "(not set)"}`);
         console.log(`  - job-id: ${jobId || "(not set)"}`);
         console.log(`  - label: ${label || "(not set)"}`);
         console.log(`  - archive-path: ${archivePath || "(not set)"}`);
         core.endGroup();
-        core.startGroup("Step 2: Validate parameters");
+        // Step 2: Upload files
+        // files param: each file uploaded individually (1 API call per file)
+        // files-dir merged: each merged file uploaded individually (1 API call per merged file)
+        core.startGroup("Step 2: Upload files");
+        const uploadResults = [];
         try {
-            const hasArchivePath = Boolean(archivePath);
-            const hasLabel = Boolean(label);
-            if (hasArchivePath && !hasLabel) {
-                core.error("archive-path requires label");
-                throw new Error("archive-path requires label");
+            // Upload individual files from files param
+            for (const file of individualFiles) {
+                console.log(`Uploading individual file: ${file}`);
+                const result = await uploadFiles([file], {
+                    workflowId,
+                    pipelineRunId,
+                    jobId,
+                    label,
+                    archivePath,
+                });
+                uploadResults.push({ file, result });
             }
-            if (!isLabelMode) {
-                // Pipeline mode validation: workflow-id, pipeline-run-id and job-id
-                // are all required (resolved via GitHub API)
-                if (!workflowId || !pipelineRunId || !jobId) {
-                    core.error("Pipeline mode requires workflow-id, pipeline-run-id and job-id");
-                    throw new Error("Pipeline mode requires workflow-id, pipeline-run-id and job-id");
-                }
+            // Upload merged files from files-dir param
+            for (const mergedFile of mergedFiles) {
+                console.log(`Uploading merged file: ${path.basename(mergedFile)}`);
+                const result = await uploadFiles([mergedFile], {
+                    workflowId,
+                    pipelineRunId,
+                    jobId,
+                    label,
+                    archivePath,
+                });
+                uploadResults.push({ file: mergedFile, result });
             }
         }
         finally {
             core.endGroup();
         }
-        // Step 3: Upload files
-        core.startGroup("Step 3: Upload files");
-        let uploadResult;
+        // Step 3: Set outputs
+        core.startGroup("Step 3: Set outputs");
         try {
-            uploadResult = await uploadFiles(files, {
-                workflowId,
-                pipelineRunId,
-                jobId,
-                label,
-                archivePath,
-            });
-        }
-        finally {
-            core.endGroup();
-        }
-        // Step 4: Set outputs
-        core.startGroup("Step 4: Set outputs");
-        try {
-            const success = uploadResult.status >= 200 && uploadResult.status < 300;
+            const allSuccess = uploadResults.every(({ result }) => result.status >= 200 && result.status < 300);
+            const statusCodes = uploadResults
+                .map(({ result }) => String(result.status))
+                .join(", ");
+            const responseSummary = uploadResults
+                .map(({ file, result }) => ({
+                file: path.basename(file),
+                status: result.status,
+                data: result.data,
+            }));
             console.log("Execution outputs:");
-            if (success) {
+            console.log(`  - total uploads: ${uploadResults.length}`);
+            console.log(`  - status codes: ${statusCodes}`);
+            if (allSuccess) {
                 core.setOutput("success", "true");
-                core.setOutput("status-code", String(uploadResult.status));
-                core.setOutput("response-text", JSON.stringify(uploadResult.data));
+                core.setOutput("status-code", statusCodes);
+                core.setOutput("response-text", JSON.stringify(responseSummary));
                 console.log("=".repeat(60));
                 console.log("Metadata upload completed successfully");
                 console.log("=".repeat(60));
             }
             else {
+                const failed = uploadResults.filter(({ result }) => result.status < 200 || result.status >= 300);
                 core.setOutput("success", "false");
-                core.setOutput("status-code", String(uploadResult.status));
-                core.setOutput("response-text", JSON.stringify(uploadResult.data));
-                core.error(`Upload failed with status ${uploadResult.status}`);
-                core.setFailed(`Upload failed with status ${uploadResult.status}`);
+                core.setOutput("status-code", statusCodes);
+                core.setOutput("response-text", JSON.stringify(responseSummary));
+                core.error(`Upload failed for ${failed.length}/${uploadResults.length} files: ` +
+                    failed.map((f) => `${path.basename(f.file)}=${f.result.status}`).join(", "));
+                core.setFailed(`Upload failed for ${failed.length}/${uploadResults.length} files`);
             }
         }
         finally {

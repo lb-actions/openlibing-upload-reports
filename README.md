@@ -16,6 +16,7 @@
 - **OIDC 联邦认证**：通过工作流 OIDC ID Token 换取华为云 STS 临时凭证，使用 V11-HMAC-SHA256 签名上传请求，无需在仓库中存储 AK/SK 或 appcode。
 - **双模式上传**：支持流水线模式（自动解析 workflow/job ID）与标签模式（自定义归档路径），适配不同归档场景。
 - **路径安全校验**：对 `files`、`label`、`archive-path` 进行路径穿越与字符白名单校验，限制绝对路径仅允许 `/home`、`/tmp` 前缀。
+- **目录批量合并**：通过 `files-dir` 指定目录，自动读取目录下所有 `.xml` 文件，按根元素格式（`metadata` / `testsuites`）分类合并为最多 2 个文件后上传。
 - **多文件批量上传**：支持空格分隔的多文件批量上传，自动推断 MIME 类型并构造 `multipart/form-data` 请求体。
 - **GitHub 原生**：运行于 [GitHub Actions](https://docs.github.com/en/actions)，使用 `GITHUB_*` 环境变量与 `actions/github-context`，运行时为 `node24`。
 
@@ -84,16 +85,40 @@ jobs:
           archive-path: 2026-09/run1
 ```
 
+### 目录合并示例（files-dir）
+
+当测试产物为目录下一组 XML 文件时，使用 `files-dir` 自动按格式分类合并后上传：
+
+```yaml
+- name: Upload reports from directory
+  uses: lb-actions/openlibing-upload-reports@v1
+  with:
+    files-dir: ./test-reports
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+#### testsuite 格式报告生成方式
+
+`files-dir` 会将根元素为 `<testsuites>`/`<testsuite>` 的文件识别为 testsuite 格式并合并为 `test_result_<suffix>.xml`。该格式报告需业务侧在测试阶段自行生成，常见方式如下：
+
+| 测试框架 | 生成方式 |
+| :--- | :--- |
+| **pytest** | 运行时附加 `--junitxml=<path>` 参数，例如 `pytest --junitxml=./test-reports/result.xml` |
+| **unittest** | 安装 [`unittest-xml-reporting`](https://pypi.org/project/unittest-xml-reporting/) 后，通过 `xmlrunner` 的 `-o`/`--output` 参数指定输出目录，例如 `python -m xmlrunner discover -o ./test-reports` |
+
+> 生成的 XML 文件需落入 `files-dir` 指定的目录内，插件会自动扫描并合并。
+
 ## 输入参数 (Inputs)
 
 | 参数名称         | 是否必填 | 默认值 | 描述说明                                                                                                                                                          |
 | :--------------- | :------: | :----- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `files`          | **是**   | 无     | 待上传文件路径，空格分隔的字符串。示例：`"metadata.xml results.xml"`。仅允许相对路径或 `/home`、`/tmp` 前缀的绝对路径，禁止包含 `..`。                            |
+| `files`          |    否    | 无     | 待上传文件路径，空格分隔的字符串。示例：`"metadata.xml results.xml"`。仅允许相对路径或 `/home`、`/tmp` 前缀的绝对路径，禁止包含 `..`。与 `files-dir` 至少提供一个。 |
+| `files-dir`      |    否    | 无     | 待上传文件所在目录。读取该目录下所有 `.xml` 文件，按根元素格式（`metadata` / `testsuites`）分类合并为最多 2 个文件后上传。与 `files` 至少提供一个。路径校验规则同 `files`。 |
 | `github-token`   |    否    | 无     | GitHub API Token，流水线模式下通过 GitHub API 解析 workflow ID 与 job ID。**建议传入 `${{ secrets.GITHUB_TOKEN }}`**：未提供时将以匿名方式调用 GitHub API，受 60 次/小时/IP 的速率限制，而 GitHub Actions runner 共享出口 IP 极易触发限流返回 403 导致流程失败；私有仓库必须传入。 |
 | `label`          |    否    | 无     | 归档路径标签（如 `"performance"`、`"precision"`、`"simulation"`）。仅允许字母、数字、下划线、连字符、点，长度上限 256。提供时进入标签模式。                      |
 | `archive-path`   |    否    | 无     | 自定义归档子路径，必须与 `label` 同时使用。仅允许字母、数字、斜杠、连字符、下划线、点、空格，长度上限 256，禁止包含 `..`。                                          |
 
-> **⚠️ 请求体大小限制**：受 APIG 接口约束，单次请求 Body 最大为 **12 MB**。多个文件以 `multipart/form-data` 形式合并为单次请求上传，请确保所有文件大小之和不超过此上限；超出时上传会失败。如需上传更大体积的数据，请拆分为多次调用或先压缩。
+> **⚠️ 请求体大小限制**：受 APIG 接口约束，单次请求 Body 最大为 **12 MB**。多个文件以 `multipart/form-data` 形式合并为单次请求上传，请确保所有文件大小之和不超过此上限；超出时上传会失败。如需上传更大体积的数据，请拆分为多次调用或先压缩。`files-dir` 合并产物另受 12 MB 单文件上限校验，超出时直接报错。
 
 ## 输出参数 (Outputs)
 

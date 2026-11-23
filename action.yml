@@ -4,8 +4,11 @@ author: 'openlibing'
 
 inputs:
   files:
-    description: 'File paths to upload (space-separated). Example: "metadata.xml results.xml"'
-    required: true
+    description: 'File paths to upload individually (space-separated). Each file is uploaded via a separate API call. At least one of files or files-dir required.'
+    required: false
+  files-dir:
+    description: 'Directory path. All XML files in this directory will be merged by format (metadata/testsuites) and uploaded. Non-recursive. At least one of files or files-dir required.'
+    required: false
   github-token:
     description: 'GitHub token for API authentication. Required if not using label.'
     required: false
