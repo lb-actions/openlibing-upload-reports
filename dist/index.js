@@ -66,6 +66,19 @@ function validateFilePath(filePath) {
     }
     // Resolve path (works for both relative and absolute paths)
     const resolvedPath = path.resolve(trimmedPath);
+    // Reject symbolic links to prevent symlink-based attacks
+    try {
+        const stats = fs.lstatSync(resolvedPath);
+        if (stats.isSymbolicLink()) {
+            throw new Error(`Symbolic links are not allowed: ${trimmedPath}`);
+        }
+    }
+    catch (err) {
+        if (err.message.includes("Symbolic links")) {
+            throw err;
+        }
+        // Path does not exist yet — nothing to check
+    }
     // For absolute paths, check against allowed directories whitelist
     if (path.isAbsolute(trimmedPath)) {
         // Security: Use explicit paths instead of process.cwd() to avoid exposing sensitive files
