@@ -586,6 +586,10 @@ async function run(): Promise<void> {
       if (xmlFiles.length === 0) {
         throw new Error(`No XML files found in files-dir: ${filesDirInput}`);
       }
+      console.log(
+        `Found ${xmlFiles.length} XML files to merge: ` +
+          xmlFiles.map((f) => path.basename(f)).join(", ")
+      );
 
       // Classify by root element format
       const metadataXmls: string[] = [];
